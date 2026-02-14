@@ -63,11 +63,10 @@ def get_client():
     except Exception:
         pass
 
-    # First-time auth — opens browser
-    print("First-time authentication — a browser window will open.")
-    print("Log in to Schwab, then copy the redirect URL back here.")
+    # First-time auth — manual flow (no local server needed)
+    print("First-time authentication — follow the instructions below.")
     try:
-        c = auth.client_from_login_flow(
+        c = auth.client_from_manual_flow(
             api_key, app_secret, CALLBACK_URL, TOKEN_PATH
         )
         print("Authentication successful! Token saved.")

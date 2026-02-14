@@ -288,9 +288,13 @@ def collect_orb_events(intraday, daily, vix_data, use_5min=True):
         prev_low = None
         prev_volume = None
 
-        for day_date, day_df in trading_days:
+        for day_date, day_df_full in trading_days:
+            # Extract pre-market / overnight session BEFORE filtering to RTH
+            pre_market = day_df_full.between_time("04:00", "09:29")
+            overnight = day_df_full.between_time("18:00", "03:59")
+
             # Regular trading hours for futures: 9:30 - 16:00 ET
-            day_df = day_df.between_time("09:30", "15:59")
+            day_df = day_df_full.between_time("09:30", "15:59")
             if len(day_df) < or_bars_needed + 2:
                 if len(day_df) > 0:
                     prev_close = float(day_df["Close"].iloc[-1])
@@ -510,6 +514,40 @@ def collect_orb_events(intraday, daily, vix_data, use_5min=True):
 
             dow = pd.Timestamp(day_date).weekday()
 
+            # -- Overnight / Pre-market features --
+            on_range_atr = None
+            on_trend = None
+            on_vol_ratio = None
+            on_high_vs_or = None
+            on_low_vs_or = None
+            or_broke_on_high = None
+            or_broke_on_low = None
+            pre_market_trend = None
+
+            if len(pre_market) >= 3:
+                pm_high = float(pre_market["High"].max())
+                pm_low = float(pre_market["Low"].min())
+                pm_open = float(pre_market["Open"].iloc[0])
+                pm_close = float(pre_market["Close"].iloc[-1])
+                pm_range = pm_high - pm_low
+                pm_vol = float(pre_market["Volume"].sum())
+
+                on_range_atr = pm_range / atr_val if atr_val > 0 else None
+                on_trend = (pm_close - pm_open) / pm_range if pm_range > 0 else 0
+                on_vol_ratio = pm_vol / (or_volume if or_volume > 0 else 1)
+
+                on_high_vs_or = (pm_high - or_high) / atr_val
+                on_low_vs_or = (pm_low - or_low) / atr_val
+
+                or_broke_on_high = 1 if or_high > pm_high else 0
+                or_broke_on_low = 1 if or_low < pm_low else 0
+
+                # Pre-market directional alignment with breakout
+                if breakout_direction == "long":
+                    pre_market_trend = 1 if pm_close > pm_open else (-1 if pm_close < pm_open else 0)
+                else:
+                    pre_market_trend = 1 if pm_close < pm_open else (-1 if pm_close > pm_open else 0)
+
             # -- Build event --
             event = {
                 "symbol": ticker,
@@ -558,6 +596,15 @@ def collect_orb_events(intraday, daily, vix_data, use_5min=True):
                 "price_vs_vwap_atr": round(price_vs_vwap, 4),
                 "or_vs_prev_high_atr": round(or_vs_prev_high, 4) if or_vs_prev_high is not None else None,
                 "or_vs_prev_low_atr": round(or_vs_prev_low, 4) if or_vs_prev_low is not None else None,
+                # Overnight / pre-market
+                "on_range_atr": round(on_range_atr, 4) if on_range_atr is not None else None,
+                "on_trend": round(on_trend, 4) if on_trend is not None else None,
+                "on_vol_ratio": round(on_vol_ratio, 4) if on_vol_ratio is not None else None,
+                "on_high_vs_or": round(on_high_vs_or, 4) if on_high_vs_or is not None else None,
+                "on_low_vs_or": round(on_low_vs_or, 4) if on_low_vs_or is not None else None,
+                "or_broke_on_high": or_broke_on_high,
+                "or_broke_on_low": or_broke_on_low,
+                "pre_market_aligned": pre_market_trend,
             }
             all_events.append(event)
 
@@ -576,6 +623,25 @@ def collect_orb_events(intraday, daily, vix_data, use_5min=True):
             })
 
         print(f"  {ticker}: {sum(1 for e in all_events if e['symbol'] == ticker)} events")
+
+    # -- Cross-asset conviction (second pass) --
+    # For each event, check if the other symbol also broke out same direction that day
+    by_date = {}
+    for e in all_events:
+        by_date.setdefault(e["date"], []).append(e)
+
+    for e in all_events:
+        same_day = by_date.get(e["date"], [])
+        other = [x for x in same_day if x["symbol"] != e["symbol"]]
+        if other:
+            o = other[0]
+            # 1 = same direction, -1 = opposite, 0 = no match
+            e["cross_asset_agree"] = 1 if o["direction"] == e["direction"] else -1
+            # Other symbol's OR range relative to its own (size confirmation)
+            e["cross_or_range_ratio"] = round(o["or_range_pts"] / e["or_range_pts"], 4) if e["or_range_pts"] > 0 else None
+        else:
+            e["cross_asset_agree"] = 0
+            e["cross_or_range_ratio"] = None
 
     return all_events
 
@@ -717,6 +783,12 @@ def run_analysis(events):
         "rsi_14", "bb_width",
         "vix", "day_of_week", "price_vs_vwap_atr",
         "or_vs_prev_high_atr", "or_vs_prev_low_atr",
+        # Overnight / pre-market
+        "on_range_atr", "on_trend", "on_vol_ratio",
+        "on_high_vs_or", "on_low_vs_or",
+        "or_broke_on_high", "or_broke_on_low", "pre_market_aligned",
+        # Cross-asset
+        "cross_asset_agree", "cross_or_range_ratio",
     ]
     feature_cols = [c for c in feature_cols if c in df.columns]
 
@@ -890,6 +962,116 @@ def run_analysis(events):
             print(f"  {r['filter']:<45} WR={r['win_rate']:.1%} (edge={r['edge']:+.1%})  EOD={r['avg_eod_r']:.3f}R  n={r['n']}")
     else:
         print("  No filters found with significant edge.")
+
+    # ── 6. TRASH FILTER ──
+    print(f"\n{'='*70}")
+    print("6. TRASH FILTER (Remove worst setups)")
+    print(f"{'='*70}")
+
+    # Find single-feature filters that reliably predict BAD setups
+    # Use bottom/top quartile cuts, require at least 20% of data and WR drop >= 8%
+    trash_filters = []
+    min_edge_drop = 0.12
+
+    for col in feature_cols:
+        for pct, op in [(25, "<="), (75, ">=")]:
+            threshold = df[col].quantile(pct / 100)
+            if op == "<=":
+                mask = df[col] <= threshold
+            else:
+                mask = df[col] >= threshold
+            sub = df[mask]
+            if len(sub) < 20:
+                continue
+            wr = sub["success"].mean()
+            edge = wr - base_wr
+            if edge <= -min_edge_drop:
+                trash_filters.append({
+                    "col": col, "op": op, "threshold": threshold,
+                    "wr": wr, "edge": edge, "n": len(sub),
+                    "avg_eod_r": sub["eod_pnl_r"].mean()
+                })
+
+    trash_filters.sort(key=lambda x: x["edge"])
+
+    if not trash_filters:
+        print("\n  No trash filters found with sufficient edge drop.")
+    else:
+        print(f"\n  Found {len(trash_filters)} trash filters (WR drop >= {min_edge_drop:.0%}):")
+        print(f"  Base WR: {base_wr:.1%}\n")
+        for tf in trash_filters:
+            print(f"    {tf['col']} {tf['op']} {tf['threshold']:.3f}"
+                  f"    WR={tf['wr']:.1%} (drop={tf['edge']:+.1%})  EOD={tf['avg_eod_r']:.3f}R  n={tf['n']}")
+
+        # Build composite trash mask: flag if ANY trash filter triggers
+        composite_trash = pd.Series(False, index=df.index)
+        for tf in trash_filters:
+            if tf["op"] == "<=":
+                composite_trash |= (df[tf["col"]] <= tf["threshold"])
+            else:
+                composite_trash |= (df[tf["col"]] >= tf["threshold"])
+
+        n_trash = composite_trash.sum()
+        n_clean = (~composite_trash).sum()
+        trash_df = df[composite_trash]
+        clean_df = df[~composite_trash]
+
+        print(f"\n  COMPOSITE FILTER (flag if ANY trash filter triggers):")
+        print(f"    Trash: {n_trash} events ({n_trash/len(df):.0%})")
+        print(f"    Clean: {n_clean} events ({n_clean/len(df):.0%})")
+
+        if n_clean >= 10:
+            clean_wr = clean_df["success"].mean()
+            trash_wr = trash_df["success"].mean() if n_trash > 0 else 0
+            print(f"\n    Trash WR:  {trash_wr:.1%}  avg_eod={trash_df['eod_pnl_r'].mean():.3f}R")
+            print(f"    Clean WR:  {clean_wr:.1%}  avg_eod={clean_df['eod_pnl_r'].mean():.3f}R")
+            print(f"    Lift:      {clean_wr - base_wr:+.1%}")
+
+            # R:R breakdown for clean events
+            print(f"\n    Clean events R:R breakdown:")
+            for rr in RR_TARGETS:
+                rr_col = f"rr_{rr}_outcome"
+                if rr_col not in clean_df.columns:
+                    continue
+                wins = (clean_df[rr_col] == "win").sum()
+                losses = (clean_df[rr_col] == "loss").sum()
+                timeouts = (clean_df[rr_col] == "timeout").sum()
+                total = len(clean_df)
+                ev = (wins * rr - losses) / total
+                print(f"      {rr}R:  Win={wins/total:.1%}  Loss={losses/total:.1%}  EV={ev:.3f}R")
+
+        # ── VALIDATION: First half vs second half ──
+        print(f"\n  VALIDATION (chronological split):")
+        df_sorted = df.sort_values("date")
+        mid = len(df_sorted) // 2
+        first_half = df_sorted.iloc[:mid]
+        second_half = df_sorted.iloc[mid:]
+
+        for label, half in [("First half", first_half), ("Second half", second_half)]:
+            trash_mask_half = pd.Series(False, index=half.index)
+            for tf in trash_filters:
+                if tf["op"] == "<=":
+                    trash_mask_half |= (half[tf["col"]] <= tf["threshold"])
+                else:
+                    trash_mask_half |= (half[tf["col"]] >= tf["threshold"])
+
+            n_h = len(half)
+            clean_h = half[~trash_mask_half]
+            trash_h = half[trash_mask_half]
+            n_clean_h = len(clean_h)
+            n_trash_h = len(trash_h)
+
+            base_wr_h = half["success"].mean()
+            clean_wr_h = clean_h["success"].mean() if n_clean_h > 5 else float("nan")
+            trash_wr_h = trash_h["success"].mean() if n_trash_h > 5 else float("nan")
+
+            date_range = f"{half['date'].iloc[0]} -> {half['date'].iloc[-1]}"
+            print(f"\n    {label} ({date_range}, n={n_h}):")
+            print(f"      Base WR:  {base_wr_h:.1%}")
+            print(f"      Trash:    n={n_trash_h}  WR={trash_wr_h:.1%}" if n_trash_h > 5 else f"      Trash:    n={n_trash_h}  (too few)")
+            print(f"      Clean:    n={n_clean_h}  WR={clean_wr_h:.1%}" if n_clean_h > 5 else f"      Clean:    n={n_clean_h}  (too few)")
+            if n_clean_h > 5:
+                print(f"      Lift:     {clean_wr_h - base_wr_h:+.1%}")
 
     print(f"\n{'='*70}")
     print("ANALYSIS COMPLETE")
